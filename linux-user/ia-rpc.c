@@ -452,6 +452,87 @@ static QDict *ia_handle_read_memory(int64_t id, QDict *params)
     return ia_make_ok_response(id, result);
 }
 
+static QDict *ia_handle_list_memory_maps(int64_t id)
+{
+    FILE *maps = NULL;
+    char *line = NULL;
+    size_t line_cap = 0;
+    QDict *result = qdict_new();
+    QList *regions = qlist_new();
+
+    qemu_mutex_lock(&ia_state.lock);
+    if (!ia_state.attached || !ia_state.current_cpu) {
+        qemu_mutex_unlock(&ia_state.lock);
+        qobject_unref(regions);
+        qobject_unref(result);
+        return ia_make_error_response(id, "not_attached", "backend is not attached");
+    }
+    if (ia_state.exec_state == IA_EXEC_RUNNING) {
+        qemu_mutex_unlock(&ia_state.lock);
+        qobject_unref(regions);
+        qobject_unref(result);
+        return ia_make_error_response(id, "invalid_state", "memory maps are only available while paused");
+    }
+    qemu_mutex_unlock(&ia_state.lock);
+
+    maps = fopen("/proc/self/maps", "r");
+    if (!maps) {
+        qobject_unref(regions);
+        qobject_unref(result);
+        return ia_make_error_response(id, "internal_error", "failed to open /proc/self/maps");
+    }
+
+    while (getline(&line, &line_cap, maps) > 0) {
+        unsigned long long start_addr = 0;
+        unsigned long long end_addr = 0;
+        unsigned long long offset = 0;
+        unsigned long long inode = 0;
+        char perms[5] = {0};
+        char dev[16] = {0};
+        char name_raw[4096] = {0};
+        int fields;
+        char perm_norm[4] = "---";
+        QDict *entry;
+        g_autofree char *start_hex = NULL;
+        g_autofree char *end_hex = NULL;
+
+        fields = sscanf(line,
+                        "%llx-%llx %4s %llx %15s %llu %4095[^\n]",
+                        &start_addr, &end_addr, perms, &offset, dev, &inode, name_raw);
+        if (fields < 6) {
+            continue;
+        }
+
+        perm_norm[0] = (perms[0] != '\0') ? perms[0] : '-';
+        perm_norm[1] = (perms[1] != '\0') ? perms[1] : '-';
+        perm_norm[2] = (perms[2] != '\0') ? perms[2] : '-';
+
+        entry = qdict_new();
+        start_hex = g_strdup_printf("0x%llx", start_addr);
+        end_hex = g_strdup_printf("0x%llx", end_addr);
+        qdict_put_str(entry, "start", start_hex);
+        qdict_put_str(entry, "end", end_hex);
+        qdict_put_str(entry, "perm", perm_norm);
+
+        if (fields >= 7) {
+            char *name = name_raw;
+            while (*name == ' ' || *name == '\t') {
+                name++;
+            }
+            if (*name != '\0') {
+                qdict_put_str(entry, "name", name);
+            }
+        }
+
+        qlist_append(regions, entry);
+    }
+
+    free(line);
+    fclose(maps);
+    qdict_put(result, "regions", regions);
+    return ia_make_ok_response(id, result);
+}
+
 static QDict *ia_handle_disassemble(int64_t id, QDict *params)
 {
 #ifndef CONFIG_CAPSTONE
@@ -608,6 +689,9 @@ static QDict *ia_dispatch_request(QDict *request)
     }
     if (strcmp(method, "read_memory") == 0) {
         return ia_handle_read_memory(id, params);
+    }
+    if (strcmp(method, "list_memory_maps") == 0) {
+        return ia_handle_list_memory_maps(id);
     }
     if (strcmp(method, "disassemble") == 0) {
         return ia_handle_disassemble(id, params);
