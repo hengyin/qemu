@@ -38,6 +38,7 @@ typedef struct IAState {
     char *socket_path;
     CPUState *current_cpu;
     uint64_t block_budget;
+    uint64_t instruction_budget;
     bool stop_address_enabled;
     bool stop_address_matched;
     uint64_t stop_address;
@@ -189,7 +190,7 @@ static QDict *ia_handle_capabilities(int64_t id)
     qdict_put_bool(caps, "trace_memory", false);
     qdict_put_bool(caps, "trace_syscall", false);
     qdict_put_bool(caps, "run_until_address", true);
-    qdict_put_bool(caps, "single_step", false);
+    qdict_put_bool(caps, "single_step", true);
     qdict_put(result, "capabilities", caps);
     return ia_make_ok_response(id, result);
 }
@@ -247,6 +248,7 @@ static QDict *ia_handle_resume_until_address(int64_t id, QDict *params)
     ia_state.stop_address_enabled = true;
     ia_state.stop_address_matched = false;
     ia_state.stop_address = address;
+    ia_state.instruction_budget = 0;
     ia_state.last_matched_pc = 0;
     ia_state.start_paused = false;
     ia_state.run_requested = true;
@@ -319,6 +321,7 @@ static QDict *ia_handle_resume_until_basic_block(int64_t id, QDict *params)
     }
 
     ia_state.block_budget = (uint64_t)count;
+    ia_state.instruction_budget = 0;
     ia_state.start_paused = false;
     ia_state.run_requested = true;
     ia_state.exec_state = IA_EXEC_RUNNING;
@@ -345,6 +348,90 @@ static QDict *ia_handle_resume_until_basic_block(int64_t id, QDict *params)
 
     qdict_put_str(result, "status", status);
     qdict_put_int(result, "blocks_executed", blocks_executed);
+    pc_hex = g_strdup_printf("0x%" PRIx64, stop_pc);
+    qdict_put_str(result, "pc", pc_hex);
+    return ia_make_ok_response(id, result);
+}
+
+static QDict *ia_handle_single_step(int64_t id, QDict *params)
+{
+    int64_t count;
+    uint64_t budget_remaining;
+    uint64_t executed;
+    uint64_t stop_pc;
+    const char *status;
+    CPUState *cpu;
+    g_autofree char *pc_hex = NULL;
+    QDict *result = qdict_new();
+
+    if (!params) {
+        qobject_unref(result);
+        return ia_make_error_response(id, "invalid_params", "params are required");
+    }
+    count = qdict_get_try_int(params, "count", -1);
+    if (count <= 0) {
+        qobject_unref(result);
+        return ia_make_error_response(id, "invalid_params", "count must be a positive integer");
+    }
+
+    qemu_mutex_lock(&ia_state.lock);
+    if (!ia_state.attached || !ia_state.current_cpu) {
+        qemu_mutex_unlock(&ia_state.lock);
+        qobject_unref(result);
+        return ia_make_error_response(id, "not_attached", "backend is not attached");
+    }
+    if (ia_state.exec_state == IA_EXEC_RUNNING || ia_state.pause_pending) {
+        qemu_mutex_unlock(&ia_state.lock);
+        qobject_unref(result);
+        return ia_make_error_response(id, "invalid_state", "backend is already running");
+    }
+
+    ia_state.block_budget = 0;
+    ia_state.stop_address_enabled = false;
+    ia_state.stop_address_matched = false;
+    ia_state.stop_address = 0;
+    ia_state.last_matched_pc = 0;
+    /*
+     * Instruction hook runs at instruction entry.  For stepping N instructions,
+     * stop when we reach the (N+1)-th instruction entry.
+     */
+    ia_state.instruction_budget = (uint64_t)count + 1;
+    ia_state.start_paused = false;
+    ia_state.run_requested = true;
+    ia_state.exec_state = IA_EXEC_RUNNING;
+    qemu_cond_signal(&ia_state.cond);
+
+    while ((ia_state.instruction_budget > 0 || ia_state.pause_pending) &&
+           ia_state.exec_state != IA_EXEC_EXITED &&
+           !ia_state.shutting_down) {
+        qemu_cond_wait(&ia_state.cond, &ia_state.lock);
+    }
+
+    budget_remaining = ia_state.instruction_budget;
+    stop_pc = ia_state.last_insn_pc;
+    cpu = ia_state.current_cpu;
+    status = ia_status_string_locked();
+    qemu_mutex_unlock(&ia_state.lock);
+
+    if (budget_remaining >= (uint64_t)count + 1) {
+        executed = 0;
+    } else {
+        executed = ((uint64_t)count + 1) - budget_remaining;
+        if (executed > 0) {
+            executed -= 1;
+        }
+    }
+
+#ifdef TARGET_X86_64
+    if (cpu && strcmp(status, "paused") == 0) {
+        CPUX86State *env = cpu_env(cpu);
+        stop_pc = env->eip;
+    }
+#endif
+
+    qdict_put_str(result, "status", status);
+    qdict_put_int(result, "count", count);
+    qdict_put_int(result, "executed", executed);
     pc_hex = g_strdup_printf("0x%" PRIx64, stop_pc);
     qdict_put_str(result, "pc", pc_hex);
     return ia_make_ok_response(id, result);
@@ -707,6 +794,9 @@ static QDict *ia_dispatch_request(QDict *request)
     if (strcmp(method, "resume_until_basic_block") == 0) {
         return ia_handle_resume_until_basic_block(id, params);
     }
+    if (strcmp(method, "single_step") == 0) {
+        return ia_handle_single_step(id, params);
+    }
     if (strcmp(method, "resume_until_address") == 0) {
         return ia_handle_resume_until_address(id, params);
     }
@@ -841,6 +931,7 @@ void ia_rpc_init(CPUState *cpu)
     ia_state.run_requested = false;
     ia_state.pause_pending = false;
     ia_state.block_budget = 0;
+    ia_state.instruction_budget = 0;
     ia_state.stop_address_enabled = false;
     ia_state.stop_address_matched = false;
     ia_state.stop_address = 0;
@@ -921,6 +1012,7 @@ void ia_rpc_set_exit_code(int code)
     ia_state.pause_pending = false;
     ia_state.stop_address_enabled = false;
     ia_state.stop_address_matched = false;
+    ia_state.instruction_budget = 0;
     ia_state.exec_state = IA_EXEC_EXITED;
     qemu_cond_broadcast(&ia_state.cond);
     qemu_mutex_unlock(&ia_state.lock);
@@ -937,8 +1029,8 @@ bool ia_should_stop_before_instruction(CPUState *cpu, vaddr pc)
     qemu_mutex_lock(&ia_state.lock);
     ia_state.current_cpu = cpu;
     ia_state.last_insn_pc = pc;
-    if (ia_state.exec_state == IA_EXEC_RUNNING && ia_state.stop_address_enabled) {
-        if (ia_state.stop_address == (uint64_t)pc) {
+    if (ia_state.exec_state == IA_EXEC_RUNNING) {
+        if (ia_state.stop_address_enabled && ia_state.stop_address == (uint64_t)pc) {
             ia_state.stop_address_enabled = false;
             ia_state.stop_address_matched = true;
             ia_state.last_matched_pc = pc;
@@ -946,6 +1038,14 @@ bool ia_should_stop_before_instruction(CPUState *cpu, vaddr pc)
             ia_state.run_requested = false;
             ia_state.pause_pending = true;
             should_stop = true;
+        } else if (ia_state.instruction_budget > 0) {
+            ia_state.instruction_budget--;
+            if (ia_state.instruction_budget == 0) {
+                ia_state.start_paused = true;
+                ia_state.run_requested = false;
+                ia_state.pause_pending = true;
+                should_stop = true;
+            }
         }
     }
     qemu_mutex_unlock(&ia_state.lock);
