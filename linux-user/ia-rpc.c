@@ -171,6 +171,29 @@ static QDict *ia_handle_query_status(int64_t id)
     return ia_make_ok_response(id, result);
 }
 
+static QDict *ia_handle_capabilities(int64_t id)
+{
+    QDict *result = qdict_new();
+    QDict *caps = qdict_new();
+
+    qdict_put_int(result, "protocol_version", 1);
+    qdict_put_bool(caps, "pause_resume", true);
+    qdict_put_bool(caps, "read_registers", true);
+    qdict_put_bool(caps, "read_memory", true);
+    qdict_put_bool(caps, "disassemble", true);
+    qdict_put_bool(caps, "list_memory_maps", true);
+    qdict_put_bool(caps, "take_snapshot", false);
+    qdict_put_bool(caps, "restore_snapshot", false);
+    qdict_put_bool(caps, "trace_basic_block", false);
+    qdict_put_bool(caps, "trace_branch", false);
+    qdict_put_bool(caps, "trace_memory", false);
+    qdict_put_bool(caps, "trace_syscall", false);
+    qdict_put_bool(caps, "run_until_address", true);
+    qdict_put_bool(caps, "single_step", false);
+    qdict_put(result, "capabilities", caps);
+    return ia_make_ok_response(id, result);
+}
+
 static QDict *ia_handle_resume(int64_t id)
 {
     QDict *result = qdict_new();
@@ -671,6 +694,9 @@ static QDict *ia_dispatch_request(QDict *request)
     id = qnum_get_int(qobject_to(QNum, id_obj));
     if (!method) {
         return ia_make_error_response(id, "invalid_request", "method is required");
+    }
+    if (strcmp(method, "capabilities") == 0) {
+        return ia_handle_capabilities(id);
     }
     if (strcmp(method, "query_status") == 0) {
         return ia_handle_query_status(id);
