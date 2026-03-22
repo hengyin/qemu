@@ -52,6 +52,7 @@
 #include "user/cpu_loop.h"
 #include "crypto/init.h"
 #include "fd-trans.h"
+#include "ia-rpc.h"
 #include "signal-common.h"
 #include "loader.h"
 #include "user-mmap.h"
@@ -1025,6 +1026,8 @@ int main(int argc, char **argv, char **envp)
     tcg_prologue_init();
 
     init_main_thread(cpu, info);
+    ia_rpc_init(cpu);
+    ia_rpc_set_exec_state(IA_EXEC_PAUSED);
 
     if (gdbstub) {
         gdbserver_start(gdbstub, &error_fatal);

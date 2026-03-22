@@ -24,6 +24,7 @@
 #include "user/cpu_loop.h"
 #include "signal-common.h"
 #include "user-mmap.h"
+#include "../ia-rpc.h"
 
 /***********************************************************/
 /* CPUX86 core interface */
@@ -211,9 +212,12 @@ void cpu_loop(CPUX86State *env)
     abi_ulong ret;
 
     for(;;) {
+        ia_wait_if_paused();
+        ia_rpc_set_exec_state(IA_EXEC_RUNNING);
         cpu_exec_start(cs);
         trapnr = cpu_exec(cs);
         cpu_exec_end(cs);
+        ia_rpc_set_exec_state(IA_EXEC_PAUSED);
         qemu_process_cpu_events(cs);
 
         switch(trapnr) {
@@ -308,6 +312,9 @@ void cpu_loop(CPUX86State *env)
             break;
         case EXCP_INTERRUPT:
             /* just indicate that signals should be handled asap */
+            break;
+        case EXCP_IA_PAUSE:
+            /* instrumentation-requested pause: no guest signal side effects */
             break;
         case EXCP_DEBUG:
             force_sig_fault(TARGET_SIGTRAP, TARGET_TRAP_BRKPT, env->eip);

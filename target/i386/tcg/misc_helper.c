@@ -23,6 +23,9 @@
 #include "exec/helper-proto.h"
 #include "exec/cputlb.h"
 #include "helper-tcg.h"
+#ifdef CONFIG_USER_ONLY
+#include "linux-user/ia-rpc.h"
+#endif
 
 /*
  * NOTE: the translator must set DisasContext.cc_op to CC_OP_EFLAGS
@@ -142,3 +145,22 @@ target_ulong HELPER(rdpid)(CPUX86State *env)
     return 0;
 #endif
 }
+
+#ifdef CONFIG_USER_ONLY
+void helper_ia_tb_start(CPUX86State *env, target_ulong pc)
+{
+    CPUState *cs = env_cpu(env);
+
+    ia_on_basic_block_executed(cs, pc);
+}
+
+void helper_ia_insn_start(CPUX86State *env, target_ulong pc)
+{
+    CPUState *cs = env_cpu(env);
+
+    if (ia_should_stop_before_instruction(cs, pc)) {
+        cs->exception_index = EXCP_IA_PAUSE;
+        cpu_loop_exit(cs);
+    }
+}
+#endif

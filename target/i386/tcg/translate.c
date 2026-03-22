@@ -3802,12 +3802,20 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
 
 static void i386_tr_tb_start(DisasContextBase *db, CPUState *cpu)
 {
+#ifdef CONFIG_USER_ONLY
+    gen_helper_ia_tb_start(tcg_env, tcg_constant_tl(db->pc_first));
+#endif
 }
 
 static void i386_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
     target_ulong pc_arg = dc->base.pc_next;
+
+#ifdef CONFIG_USER_ONLY
+    gen_update_eip_cur(dc);
+    gen_helper_ia_insn_start(tcg_env, tcg_constant_tl(dc->base.pc_next));
+#endif
 
     dc->prev_insn_start = dc->base.insn_start;
     dc->prev_insn_end = tcg_last_op();
