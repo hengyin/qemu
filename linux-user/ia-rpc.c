@@ -605,6 +605,7 @@ static QDict *ia_handle_list_memory_maps(int64_t id)
         QDict *entry;
         g_autofree char *start_hex = NULL;
         g_autofree char *end_hex = NULL;
+        g_autofree char *offset_hex = NULL;
 
         fields = sscanf(line,
                         "%llx-%llx %4s %llx %15s %llu %4095[^\n]",
@@ -623,6 +624,9 @@ static QDict *ia_handle_list_memory_maps(int64_t id)
         qdict_put_str(entry, "start", start_hex);
         qdict_put_str(entry, "end", end_hex);
         qdict_put_str(entry, "perm", perm_norm);
+        offset_hex = g_strdup_printf("0x%llx", offset);
+        qdict_put_str(entry, "offset", offset_hex);
+        qdict_put_int(entry, "inode", (int64_t)inode);
 
         if (fields >= 7) {
             char *name = name_raw;
@@ -630,6 +634,7 @@ static QDict *ia_handle_list_memory_maps(int64_t id)
                 name++;
             }
             if (*name != '\0') {
+                qdict_put_str(entry, "path", name);
                 qdict_put_str(entry, "name", name);
             }
         }
