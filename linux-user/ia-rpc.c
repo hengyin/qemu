@@ -115,27 +115,28 @@ static bool ia_copy_requested_names(QList *names, const char **out_names, size_t
     return true;
 }
 
-#ifdef TARGET_X86_64
+#if defined(TARGET_X86_64) || defined(TARGET_I386)
 static bool ia_lookup_register(CPUX86State *env, const char *name, uint64_t *out)
 {
-    if (strcmp(name, "rip") == 0) {
+    if (strcmp(name, "pc") == 0 || strcmp(name, "eip") == 0 || strcmp(name, "rip") == 0) {
         *out = env->eip;
-    } else if (strcmp(name, "rsp") == 0) {
+    } else if (strcmp(name, "esp") == 0 || strcmp(name, "rsp") == 0) {
         *out = env->regs[R_ESP];
-    } else if (strcmp(name, "rbp") == 0) {
+    } else if (strcmp(name, "ebp") == 0 || strcmp(name, "rbp") == 0) {
         *out = env->regs[R_EBP];
-    } else if (strcmp(name, "rax") == 0) {
+    } else if (strcmp(name, "eax") == 0 || strcmp(name, "rax") == 0) {
         *out = env->regs[R_EAX];
-    } else if (strcmp(name, "rbx") == 0) {
+    } else if (strcmp(name, "ebx") == 0 || strcmp(name, "rbx") == 0) {
         *out = env->regs[R_EBX];
-    } else if (strcmp(name, "rcx") == 0) {
+    } else if (strcmp(name, "ecx") == 0 || strcmp(name, "rcx") == 0) {
         *out = env->regs[R_ECX];
-    } else if (strcmp(name, "rdx") == 0) {
+    } else if (strcmp(name, "edx") == 0 || strcmp(name, "rdx") == 0) {
         *out = env->regs[R_EDX];
-    } else if (strcmp(name, "rsi") == 0) {
+    } else if (strcmp(name, "esi") == 0 || strcmp(name, "rsi") == 0) {
         *out = env->regs[R_ESI];
-    } else if (strcmp(name, "rdi") == 0) {
+    } else if (strcmp(name, "edi") == 0 || strcmp(name, "rdi") == 0) {
         *out = env->regs[R_EDI];
+#if defined(TARGET_X86_64)
     } else if (strcmp(name, "r8") == 0) {
         *out = env->regs[R_R8];
     } else if (strcmp(name, "r9") == 0) {
@@ -152,6 +153,7 @@ static bool ia_lookup_register(CPUX86State *env, const char *name, uint64_t *out
         *out = env->regs[R_R14];
     } else if (strcmp(name, "r15") == 0) {
         *out = env->regs[R_R15];
+#endif
     } else {
         return false;
     }
@@ -439,13 +441,19 @@ static QDict *ia_handle_single_step(int64_t id, QDict *params)
 
 static QDict *ia_handle_get_registers(int64_t id, QDict *params)
 {
-#ifndef TARGET_X86_64
-    return ia_make_error_response(id, "unsupported_arch", "get_registers is only implemented for x86_64");
+#if !defined(TARGET_X86_64) && !defined(TARGET_I386)
+    return ia_make_error_response(id, "unsupported_arch", "get_registers is only implemented for x86 targets");
 #else
+#if defined(TARGET_X86_64)
     static const char *default_names[] = {
         "rip", "rsp", "rbp", "rax", "rbx", "rcx", "rdx", "rsi", "rdi",
         "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
     };
+#else
+    static const char *default_names[] = {
+        "eip", "esp", "ebp", "eax", "ebx", "ecx", "edx", "esi", "edi",
+    };
+#endif
     const char *requested[32];
     size_t count = G_N_ELEMENTS(default_names);
     QList *names = NULL;
