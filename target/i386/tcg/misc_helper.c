@@ -159,8 +159,7 @@ void helper_ia_insn_start(CPUX86State *env, target_ulong pc)
     CPUState *cs = env_cpu(env);
 
     if (ia_should_stop_before_instruction(cs, pc)) {
-        cs->exception_index = EXCP_IA_PAUSE;
-        cpu_loop_exit(cs);
+        cpu_exit(cs);
     }
 }
 #endif

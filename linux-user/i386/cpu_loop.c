@@ -313,9 +313,6 @@ void cpu_loop(CPUX86State *env)
         case EXCP_INTERRUPT:
             /* just indicate that signals should be handled asap */
             break;
-        case EXCP_IA_PAUSE:
-            /* instrumentation-requested pause: no guest signal side effects */
-            break;
         case EXCP_DEBUG:
             force_sig_fault(TARGET_SIGTRAP, TARGET_TRAP_BRKPT, env->eip);
             break;
