@@ -661,8 +661,8 @@ static QDict *ia_handle_disassemble(int64_t id, QDict *params)
 #ifndef CONFIG_CAPSTONE
     return ia_make_error_response(id, "unsupported_feature", "qemu was built without capstone support");
 #else
-#ifndef TARGET_X86_64
-    return ia_make_error_response(id, "unsupported_arch", "disassemble is only implemented for x86_64");
+#if !defined(TARGET_X86_64) && !defined(TARGET_I386)
+    return ia_make_error_response(id, "unsupported_arch", "disassemble is only implemented for x86 targets");
 #else
     const char *addr_str;
     uint64_t pc;
@@ -670,7 +670,11 @@ static QDict *ia_handle_disassemble(int64_t id, QDict *params)
     CPUState *cpu;
     csh handle;
     cs_insn *insn = NULL;
+    #if defined(TARGET_X86_64)
     cs_mode mode = CS_MODE_64;
+#else
+    cs_mode mode = CS_MODE_32;
+#endif
     QDict *result = qdict_new();
     QList *instructions = qlist_new();
 
@@ -701,13 +705,15 @@ static QDict *ia_handle_disassemble(int64_t id, QDict *params)
         return ia_make_error_response(id, "invalid_state", "disassembly is only available while paused");
     }
     cpu = ia_state.current_cpu;
-#ifdef TARGET_X86_64
+#if defined(TARGET_X86_64)
     {
         CPUX86State *env = cpu_env(cpu);
         mode = (env->hflags & HF_CS64_MASK ? CS_MODE_64
                 : env->hflags & HF_CS32_MASK ? CS_MODE_32
                 : CS_MODE_16);
     }
+#elif defined(TARGET_I386)
+    mode = CS_MODE_32;
 #endif
     qemu_mutex_unlock(&ia_state.lock);
 
