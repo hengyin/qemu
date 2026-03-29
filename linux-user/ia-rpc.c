@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <stdio.h>
 
 #include "qemu.h"
 #include "user-internals.h"
@@ -40,17 +41,62 @@ typedef struct IAState {
     uint64_t block_budget;
     uint64_t instruction_budget;
     bool stop_address_enabled;
+    bool stop_address_set_enabled;
     bool stop_address_matched;
     uint64_t stop_address;
+    uint64_t stop_addresses[64];
+    size_t stop_address_count;
     uint64_t last_block_pc;
     uint64_t last_insn_pc;
     uint64_t last_matched_pc;
+    FILE *trace_file;
+    uint64_t trace_seq;
     QemuThread server_thread;
 } IAState;
 
 static IAState ia_state = {
     .listen_fd = -1,
 };
+
+static void ia_trace_emit_basic_block(CPUState *cpu, vaddr pc)
+{
+    if (!ia_state.trace_file) {
+        return;
+    }
+    ia_state.trace_seq++;
+    fprintf(
+        ia_state.trace_file,
+        "{\"event_id\":\"e-%" PRIu64 "\",\"seq\":%" PRIu64 ",\"type\":\"basic_block\","
+        "\"timestamp\":%.6f,\"pc\":\"0x%" PRIx64 "\",\"thread_id\":\"1\",\"cpu_id\":%d,"
+        "\"payload\":{\"start\":\"0x%" PRIx64 "\",\"end\":\"0x%" PRIx64 "\",\"instruction_count\":1}}\n",
+        ia_state.trace_seq,
+        ia_state.trace_seq,
+        (double)g_get_real_time() / 1000000.0,
+        (uint64_t)pc,
+        cpu ? cpu->cpu_index : 0,
+        (uint64_t)pc,
+        (uint64_t)pc
+    );
+    fflush(ia_state.trace_file);
+}
+
+static void ia_trace_emit_backend_ready(void)
+{
+    if (!ia_state.trace_file) {
+        return;
+    }
+    ia_state.trace_seq++;
+    fprintf(
+        ia_state.trace_file,
+        "{\"event_id\":\"e-%" PRIu64 "\",\"seq\":%" PRIu64 ",\"type\":\"backend_ready\","
+        "\"timestamp\":%.6f,\"pc\":null,\"thread_id\":null,\"cpu_id\":null,"
+        "\"payload\":{\"status\":\"attached\"}}\n",
+        ia_state.trace_seq,
+        ia_state.trace_seq,
+        (double)g_get_real_time() / 1000000.0
+    );
+    fflush(ia_state.trace_file);
+}
 
 static const char *ia_status_string_locked(void)
 {
@@ -187,11 +233,12 @@ static QDict *ia_handle_capabilities(int64_t id)
     qdict_put_bool(caps, "list_memory_maps", true);
     qdict_put_bool(caps, "take_snapshot", false);
     qdict_put_bool(caps, "restore_snapshot", false);
-    qdict_put_bool(caps, "trace_basic_block", false);
+    qdict_put_bool(caps, "trace_basic_block", ia_state.trace_file != NULL);
     qdict_put_bool(caps, "trace_branch", false);
     qdict_put_bool(caps, "trace_memory", false);
     qdict_put_bool(caps, "trace_syscall", false);
     qdict_put_bool(caps, "run_until_address", true);
+    qdict_put_bool(caps, "run_until_any_address", true);
     qdict_put_bool(caps, "single_step", true);
     qdict_put(result, "capabilities", caps);
     return ia_make_ok_response(id, result);
@@ -248,6 +295,8 @@ static QDict *ia_handle_resume_until_address(int64_t id, QDict *params)
     }
 
     ia_state.stop_address_enabled = true;
+    ia_state.stop_address_set_enabled = false;
+    ia_state.stop_address_count = 0;
     ia_state.stop_address_matched = false;
     ia_state.stop_address = address;
     ia_state.instruction_budget = 0;
@@ -257,12 +306,116 @@ static QDict *ia_handle_resume_until_address(int64_t id, QDict *params)
     ia_state.exec_state = IA_EXEC_RUNNING;
     qemu_cond_signal(&ia_state.cond);
 
-    while ((ia_state.stop_address_enabled || ia_state.pause_pending) &&
+    while (((ia_state.stop_address_enabled || ia_state.stop_address_set_enabled) || ia_state.pause_pending) &&
            ia_state.exec_state != IA_EXEC_EXITED &&
            !ia_state.shutting_down) {
         qemu_cond_wait(&ia_state.cond, &ia_state.lock);
     }
 
+
+    stop_pc = ia_state.last_block_pc;
+    last_insn_pc = ia_state.last_insn_pc;
+    last_matched_pc = ia_state.last_matched_pc;
+    matched = ia_state.stop_address_matched;
+    cpu = ia_state.current_cpu;
+    status = ia_status_string_locked();
+    qemu_mutex_unlock(&ia_state.lock);
+
+#ifdef TARGET_X86_64
+    if (cpu && strcmp(status, "paused") == 0) {
+        CPUX86State *env = cpu_env(cpu);
+        stop_pc = env->eip;
+    }
+#endif
+
+    qdict_put_str(result, "status", status);
+    qdict_put_bool(result, "matched", matched);
+    pc_hex = g_strdup_printf("0x%" PRIx64, stop_pc);
+    qdict_put_str(result, "pc", pc_hex);
+    last_insn_hex = g_strdup_printf("0x%" PRIx64, last_insn_pc);
+    qdict_put_str(result, "last_insn_pc", last_insn_hex);
+    matched_hex = g_strdup_printf("0x%" PRIx64, last_matched_pc);
+    qdict_put_str(result, "matched_pc", matched_hex);
+    return ia_make_ok_response(id, result);
+}
+
+static QDict *ia_handle_resume_until_any_address(int64_t id, QDict *params)
+{
+    QList *addresses;
+    const QListEntry *entry;
+    size_t count = 0;
+    uint64_t stop_pc;
+    uint64_t last_insn_pc;
+    uint64_t last_matched_pc;
+    bool matched;
+    const char *status;
+    CPUState *cpu;
+    g_autofree char *pc_hex = NULL;
+    g_autofree char *last_insn_hex = NULL;
+    g_autofree char *matched_hex = NULL;
+    QDict *result = qdict_new();
+
+    if (!params) {
+        qobject_unref(result);
+        return ia_make_error_response(id, "invalid_params", "params are required");
+    }
+    addresses = qobject_to(QList, qdict_get(params, "addresses"));
+    if (!addresses) {
+        qobject_unref(result);
+        return ia_make_error_response(id, "invalid_params", "addresses must be a list");
+    }
+
+    qemu_mutex_lock(&ia_state.lock);
+    if (!ia_state.attached || !ia_state.current_cpu) {
+        qemu_mutex_unlock(&ia_state.lock);
+        qobject_unref(result);
+        return ia_make_error_response(id, "not_attached", "backend is not attached");
+    }
+    if (ia_state.exec_state == IA_EXEC_RUNNING || ia_state.pause_pending) {
+        qemu_mutex_unlock(&ia_state.lock);
+        qobject_unref(result);
+        return ia_make_error_response(id, "invalid_state", "backend is already running");
+    }
+
+    QLIST_FOREACH_ENTRY(addresses, entry) {
+        QString *item = qobject_to(QString, qlist_entry_obj(entry));
+        uint64_t address = 0;
+        if (!item || count >= G_N_ELEMENTS(ia_state.stop_addresses) ||
+            qemu_strtou64(qstring_get_str(item), NULL, 0, &address) != 0) {
+            qemu_mutex_unlock(&ia_state.lock);
+            qobject_unref(result);
+            return ia_make_error_response(
+                id,
+                "invalid_params",
+                "addresses must contain 1-64 hex strings"
+            );
+        }
+        ia_state.stop_addresses[count++] = address;
+    }
+
+    if (count == 0) {
+        qemu_mutex_unlock(&ia_state.lock);
+        qobject_unref(result);
+        return ia_make_error_response(id, "invalid_params", "addresses must not be empty");
+    }
+
+    ia_state.stop_address_enabled = false;
+    ia_state.stop_address_set_enabled = true;
+    ia_state.stop_address_count = count;
+    ia_state.stop_address_matched = false;
+    ia_state.stop_address = 0;
+    ia_state.instruction_budget = 0;
+    ia_state.last_matched_pc = 0;
+    ia_state.start_paused = false;
+    ia_state.run_requested = true;
+    ia_state.exec_state = IA_EXEC_RUNNING;
+    qemu_cond_signal(&ia_state.cond);
+
+    while (((ia_state.stop_address_enabled || ia_state.stop_address_set_enabled) || ia_state.pause_pending) &&
+           ia_state.exec_state != IA_EXEC_EXITED &&
+           !ia_state.shutting_down) {
+        qemu_cond_wait(&ia_state.cond, &ia_state.lock);
+    }
 
     stop_pc = ia_state.last_block_pc;
     last_insn_pc = ia_state.last_insn_pc;
@@ -390,6 +543,8 @@ static QDict *ia_handle_single_step(int64_t id, QDict *params)
 
     ia_state.block_budget = 0;
     ia_state.stop_address_enabled = false;
+    ia_state.stop_address_set_enabled = false;
+    ia_state.stop_address_count = 0;
     ia_state.stop_address_matched = false;
     ia_state.stop_address = 0;
     ia_state.last_matched_pc = 0;
@@ -819,6 +974,9 @@ static QDict *ia_dispatch_request(QDict *request)
     if (strcmp(method, "resume_until_address") == 0) {
         return ia_handle_resume_until_address(id, params);
     }
+    if (strcmp(method, "resume_until_any_address") == 0) {
+        return ia_handle_resume_until_any_address(id, params);
+    }
     if (strcmp(method, "get_registers") == 0) {
         return ia_handle_get_registers(id, params);
     }
@@ -901,6 +1059,7 @@ void ia_rpc_init(CPUState *cpu)
 {
     struct sockaddr_un addr;
     const char *socket_path = getenv("IA_RPC_SOCKET");
+    const char *trace_path = getenv("IA_TRACE_FILE");
 
     if (!socket_path || !*socket_path) {
         return;
@@ -952,11 +1111,27 @@ void ia_rpc_init(CPUState *cpu)
     ia_state.block_budget = 0;
     ia_state.instruction_budget = 0;
     ia_state.stop_address_enabled = false;
+    ia_state.stop_address_set_enabled = false;
+    ia_state.stop_address_count = 0;
     ia_state.stop_address_matched = false;
     ia_state.stop_address = 0;
     ia_state.last_block_pc = 0;
     ia_state.last_insn_pc = 0;
     ia_state.last_matched_pc = 0;
+    ia_state.trace_seq = 0;
+    if (ia_state.trace_file) {
+        fclose(ia_state.trace_file);
+        ia_state.trace_file = NULL;
+    }
+    if (trace_path && trace_path[0] != '\0') {
+        ia_state.trace_file = fopen(trace_path, "a");
+        if (!ia_state.trace_file) {
+            error_report("ia-rpc: failed to open IA_TRACE_FILE %s: %s", trace_path, strerror(errno));
+        } else {
+            setvbuf(ia_state.trace_file, NULL, _IOLBF, 0);
+            ia_trace_emit_backend_ready();
+        }
+    }
     ia_state.exec_state = IA_EXEC_PAUSED;
     ia_state.enabled = true;
     ia_state.shutting_down = false;
@@ -982,6 +1157,10 @@ void ia_rpc_shutdown(void)
     if (ia_state.socket_path) {
         unlink(ia_state.socket_path);
         g_clear_pointer(&ia_state.socket_path, g_free);
+    }
+    if (ia_state.trace_file) {
+        fclose(ia_state.trace_file);
+        ia_state.trace_file = NULL;
     }
     qemu_mutex_unlock(&ia_state.lock);
 }
@@ -1030,6 +1209,8 @@ void ia_rpc_set_exit_code(int code)
     ia_state.has_exit_code = true;
     ia_state.pause_pending = false;
     ia_state.stop_address_enabled = false;
+    ia_state.stop_address_set_enabled = false;
+    ia_state.stop_address_count = 0;
     ia_state.stop_address_matched = false;
     ia_state.instruction_budget = 0;
     ia_state.exec_state = IA_EXEC_EXITED;
@@ -1049,7 +1230,24 @@ bool ia_should_stop_before_instruction(CPUState *cpu, vaddr pc)
     ia_state.current_cpu = cpu;
     ia_state.last_insn_pc = pc;
     if (ia_state.exec_state == IA_EXEC_RUNNING) {
+        bool address_match = false;
         if (ia_state.stop_address_enabled && ia_state.stop_address == (uint64_t)pc) {
+            address_match = true;
+            ia_state.stop_address_enabled = false;
+        } else if (ia_state.stop_address_set_enabled) {
+            size_t i;
+            for (i = 0; i < ia_state.stop_address_count; i++) {
+                if (ia_state.stop_addresses[i] == (uint64_t)pc) {
+                    address_match = true;
+                    break;
+                }
+            }
+            if (address_match) {
+                ia_state.stop_address_set_enabled = false;
+                ia_state.stop_address_count = 0;
+            }
+        }
+        if (address_match) {
             ia_state.stop_address_enabled = false;
             ia_state.stop_address_matched = true;
             ia_state.last_matched_pc = pc;
@@ -1083,6 +1281,7 @@ void ia_on_basic_block_executed(CPUState *cpu, vaddr pc)
     qemu_mutex_lock(&ia_state.lock);
     ia_state.current_cpu = cpu;
     ia_state.last_block_pc = pc;
+    ia_trace_emit_basic_block(cpu, pc);
     if (ia_state.exec_state == IA_EXEC_RUNNING && ia_state.block_budget > 0) {
         ia_state.block_budget--;
         if (ia_state.block_budget == 0) {
